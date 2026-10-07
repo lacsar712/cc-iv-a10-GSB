@@ -19,6 +19,8 @@ USERS = {
     "watcher": {"role": "reader", "password_hash": pwd.hash("watch123456")},
 }
 
+REJECTION_REASON = "组串 {code} 被红外热像标记超温（在超温名单内），本次扫描整份拒收"
+
 
 def dump(row):
     out = dict(row)
@@ -78,7 +80,7 @@ def need_login(request: Request):
 def need_writer(request: Request):
     user = need_login(request)
     if user["role"] != "writer":
-        raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail="仅扫描员可提交IV扫描")
+        raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail="仅扫描员可操作")
     return user
 
 
@@ -128,17 +130,150 @@ async def create_log(request: Request) -> dict:
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="电压电流与填充因子必须是数字")
     now = datetime.now(timezone.utc)
+    rejected_reason = None
     with connect() as conn:
-        row = conn.execute(
-            """INSERT INTO iv_scans
-               (string_code, voc_v, isc_a, fill_factor, status, created_by, created_at)
-               VALUES (%s,%s,%s,%s,'pending',%s,%s)
-               RETURNING id, string_code, voc_v, isc_a, fill_factor, status, verdict, reason,
-                         created_by, created_at, processed_at""",
-            (code, voc, isc, ff, user["username"], now),
-        ).fetchone()
+        # 名单总开关行先锁，扳开关/点名与提交抢时刻时在此排队，
+        # 保证"收下"与"挡回"只有一种收场，不会既进队列又挂超温。
+        with conn.transaction():
+            setting = conn.execute(
+                "SELECT enabled FROM overtemp_settings WHERE id = 1 FOR UPDATE"
+            ).fetchone()
+            hit = conn.execute(
+                """SELECT id FROM overtemp_strings
+                   WHERE string_code = %s AND active = true""",
+                (code,),
+            ).fetchone()
+            if setting is not None and setting["enabled"] and hit is not None:
+                reason = REJECTION_REASON.format(code=code)
+                # 挡回痕迹与拒收判定同一事务落库
+                conn.execute(
+                    """INSERT INTO overtemp_rejections
+                       (string_code, voc_v, isc_a, fill_factor, list_enabled, reason,
+                        created_by, rejected_by, rejected_at)
+                       VALUES (%s,%s,%s,%s,true,%s,%s,'system',%s)""",
+                    (code, voc, isc, ff, reason, user["username"], now),
+                )
+                rejected_reason = reason
+            else:
+                row = conn.execute(
+                    """INSERT INTO iv_scans
+                       (string_code, voc_v, isc_a, fill_factor, status, created_by, created_at)
+                       VALUES (%s,%s,%s,%s,'pending',%s,%s)
+                       RETURNING id, string_code, voc_v, isc_a, fill_factor, status, verdict,
+                                 reason, created_by, created_at, processed_at""",
+                    (code, voc, isc, ff, user["username"], now),
+                ).fetchone()
         conn.commit()
-        return dump(row)
+    if rejected_reason is not None:
+        raise HTTPException(status_code=409, detail=rejected_reason)
+    return dump(row)
 
 
-app = Litestar(route_handlers=[health, login, list_logs, create_log])
+@get("/api/overtemp")
+async def overtemp_state(request: Request) -> dict:
+    need_login(request)
+    with connect() as conn:
+        setting = conn.execute(
+            """SELECT enabled, updated_by, updated_at
+               FROM overtemp_settings WHERE id = 1"""
+        ).fetchone()
+        strings = conn.execute(
+            """SELECT id, string_code, active, created_by, created_at, updated_by, updated_at
+               FROM overtemp_strings ORDER BY id DESC"""
+        ).fetchall()
+        rejections = conn.execute(
+            """SELECT id, string_code, voc_v, isc_a, fill_factor, list_enabled, reason,
+                      created_by, rejected_by, rejected_at
+               FROM overtemp_rejections ORDER BY id DESC LIMIT 100"""
+        ).fetchall()
+    return {
+        "enabled": setting["enabled"] if setting else False,
+        "updated_by": setting["updated_by"] if setting else None,
+        "updated_at": setting["updated_at"].isoformat()
+        if setting and setting["updated_at"] else None,
+        "strings": [dump(r) for r in strings],
+        "rejections": [dump(r) for r in rejections],
+    }
+
+
+@post("/api/overtemp/switch")
+async def set_overtemp_switch(request: Request) -> dict:
+    user = need_writer(request)
+    data = await request.json()
+    enabled = bool(data.get("enabled"))
+    now = datetime.now(timezone.utc)
+    with connect() as conn:
+        with conn.transaction():
+            # 与提交事务抢同一把行锁：开关落定前，该串送扫只能在锁后看新状态
+            conn.execute("SELECT id FROM overtemp_settings WHERE id = 1 FOR UPDATE")
+            row = conn.execute(
+                """UPDATE overtemp_settings
+                   SET enabled = %s, updated_by = %s, updated_at = %s
+                   WHERE id = 1
+                   RETURNING enabled, updated_by, updated_at""",
+                (enabled, user["username"], now),
+            ).fetchone()
+        conn.commit()
+    return dump(row)
+
+
+@post("/api/overtemp/strings", status_code=201)
+async def add_overtemp_string(request: Request) -> dict:
+    user = need_writer(request)
+    data = await request.json()
+    code = (data.get("string_code") or "").strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="组串编号不能为空")
+    now = datetime.now(timezone.utc)
+    with connect() as conn:
+        with conn.transaction():
+            conn.execute("SELECT id FROM overtemp_settings WHERE id = 1 FOR UPDATE")
+            row = conn.execute(
+                """INSERT INTO overtemp_strings
+                   (string_code, active, created_by, created_at, updated_by, updated_at)
+                   VALUES (%s, true, %s, %s, %s, %s)
+                   ON CONFLICT (string_code) DO UPDATE
+                     SET active = true,
+                         updated_by = EXCLUDED.created_by,
+                         updated_at = EXCLUDED.created_at
+                   RETURNING id, string_code, active, created_by, created_at,
+                             updated_by, updated_at""",
+                (code, user["username"], now, user["username"], now),
+            ).fetchone()
+        conn.commit()
+    return dump(row)
+
+
+@post("/api/overtemp/strings/{string_id:int}/switch")
+async def switch_overtemp_string(request: Request, string_id: int) -> dict:
+    user = need_writer(request)
+    data = await request.json()
+    active = bool(data.get("active"))
+    now = datetime.now(timezone.utc)
+    with connect() as conn:
+        with conn.transaction():
+            conn.execute("SELECT id FROM overtemp_settings WHERE id = 1 FOR UPDATE")
+            row = conn.execute(
+                """UPDATE overtemp_strings
+                   SET active = %s, updated_by = %s, updated_at = %s
+                   WHERE id = %s
+                   RETURNING id, string_code, active, created_by, created_at,
+                             updated_by, updated_at""",
+                (active, user["username"], now, string_id),
+            ).fetchone()
+        conn.commit()
+    if row is None:
+        raise HTTPException(status_code=404, detail="名单中没有这条组串")
+    return dump(row)
+
+
+app = Litestar(route_handlers=[
+    health,
+    login,
+    list_logs,
+    create_log,
+    overtemp_state,
+    set_overtemp_switch,
+    add_overtemp_string,
+    switch_overtemp_string,
+])

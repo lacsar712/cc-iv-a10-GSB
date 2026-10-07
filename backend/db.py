@@ -33,4 +33,39 @@ DROP TRIGGER IF EXISTS trg_iv_scan_notify ON iv_scans;
 CREATE TRIGGER trg_iv_scan_notify
 AFTER INSERT ON iv_scans
 FOR EACH ROW EXECUTE FUNCTION notify_iv_scan();
+
+CREATE TABLE IF NOT EXISTS overtemp_settings (
+    id integer PRIMARY KEY DEFAULT 1,
+    enabled boolean NOT NULL DEFAULT false,
+    updated_by text,
+    updated_at timestamptz,
+    CONSTRAINT overtemp_settings_singleton CHECK (id = 1)
+);
+INSERT INTO overtemp_settings (id, enabled) VALUES (1, false)
+ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS overtemp_strings (
+    id serial PRIMARY KEY,
+    string_code text NOT NULL UNIQUE,
+    active boolean NOT NULL DEFAULT true,
+    created_by text NOT NULL,
+    created_at timestamptz NOT NULL,
+    updated_by text,
+    updated_at timestamptz
+);
+
+CREATE TABLE IF NOT EXISTS overtemp_rejections (
+    id serial PRIMARY KEY,
+    string_code text NOT NULL,
+    voc_v double precision,
+    isc_a double precision,
+    fill_factor double precision,
+    list_enabled boolean NOT NULL,
+    reason text NOT NULL,
+    created_by text NOT NULL,
+    rejected_by text NOT NULL,
+    rejected_at timestamptz NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_overtemp_rejections_string
+    ON overtemp_rejections (string_code, id DESC);
 """
