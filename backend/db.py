@@ -33,4 +33,29 @@ DROP TRIGGER IF EXISTS trg_iv_scan_notify ON iv_scans;
 CREATE TRIGGER trg_iv_scan_notify
 AFTER INSERT ON iv_scans
 FOR EACH ROW EXECUTE FUNCTION notify_iv_scan();
+
+-- 红外热像超温名单：点名入队后该组串的新扫描整份挡回
+CREATE TABLE IF NOT EXISTS hot_strings (
+    id serial PRIMARY KEY,
+    string_code text NOT NULL UNIQUE,
+    active boolean NOT NULL DEFAULT true,
+    created_by text NOT NULL,
+    created_at timestamptz NOT NULL,
+    updated_by text,
+    updated_at timestamptz NOT NULL
+);
+
+-- 挡回痕迹：与真实拒收同事务写入，连同提交内容一并留档
+CREATE TABLE IF NOT EXISTS block_traces (
+    id serial PRIMARY KEY,
+    string_code text NOT NULL,
+    voc_v double precision NOT NULL,
+    isc_a double precision NOT NULL,
+    fill_factor double precision NOT NULL,
+    submitted_by text NOT NULL,
+    reason text NOT NULL,
+    blocked_at timestamptz NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_block_traces_string
+    ON block_traces (string_code, blocked_at DESC);
 """
